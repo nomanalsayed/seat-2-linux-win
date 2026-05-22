@@ -1,4 +1,4 @@
-import os, sys, time, json, threading, urllib.parse
+import os, sys, time, json, threading, urllib.parse, random
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
@@ -44,7 +44,7 @@ input:focus{outline:2px solid #4a6cf7;border-color:transparent}
 </div>
 <div class="row">
 <div class="field"><label>Class</label><input name="cls" value="SNIGDHA"></div>
-<div class="field"><label>Travel Date</label><input name="travel_date" type="date" value="2026-06-03"></div>
+                <div class="field"><label>Travel Date (YYYY-MM-DD or DD-MM-YYYY)</label><input name="travel_date" type="date" value="2026-06-03"></div>
 </div>
 <div class="row">
 <div class="field"><label>Train Name</label><input name="train" value="PANCHAGARH EXPRESS (794)"></div>
@@ -56,7 +56,7 @@ input:focus{outline:2px solid #4a6cf7;border-color:transparent}
 <div class="field"><label>Date</label><input name="click_date" type="date" value="2026-05-23"></div>
 <div class="field"><label>Time</label><input name="click_time" type="time" value="08:00:01" step="1"></div>
 </div>
-<div class="field"><label>Preferred Seats (comma separated)</label><input name="seats" value="GHA-75,GHA-76"></div>
+                <div class="field"><label>Seat Numbers (e.g. 75,76 or GHA-75,GHA-76)</label><input name="seats" value="75,76"></div>
 <button class="btn" type="submit" id="startBtn">Start Booking</button>
 </form>
 <div id="countdown"></div>
@@ -162,7 +162,7 @@ class Handler(BaseHTTPRequestHandler):
         click_tm = config.get("click_time", "08:00:01")
         ymd = click_dt.split("-")
         hmss = click_tm.split(":")
-        tgt = datetime(int(ymd[0]), int(ymd[1]), int(ymd[2]), int(hmss[0]), int(hmss[1]))
+        tgt = datetime(int(ymd[0]), int(ymd[1]), int(ymd[2]), int(hmss[0]), int(hmss[1]), int(hmss[2]))
         target_ts = int(tgt.timestamp() * 1000)
         log("Config received. Starting booking...")
         self.send_response(200)
@@ -203,7 +203,11 @@ try:
     TO = config.get("to", "Dhaka")
     CLASS = config.get("cls", "SNIGDHA")
     raw_date = config.get("travel_date", "2026-06-03")
-    d = datetime.strptime(raw_date.split("T")[0], "%Y-%m-%d")
+    raw_date = raw_date.split("T")[0].strip()
+    try:
+        d = datetime.strptime(raw_date, "%Y-%m-%d")
+    except ValueError:
+        d = datetime.strptime(raw_date, "%d-%m-%Y")
     TARGET_DATE = d.strftime("%d-%b-%Y")
     target_train = config.get("train", "PANCHAGARH EXPRESS (794)")
     num_seats = int(config.get("num_seats", "3"))
@@ -211,9 +215,9 @@ try:
     click_tm = config.get("click_time", "08:00:01")
     ymd = click_dt.split("-")
     hmss = click_tm.split(":")
-    CLICK_TIME = datetime(int(ymd[0]), int(ymd[1]), int(ymd[2]), int(hmss[0]), int(hmss[1]))
-    seats_raw = config.get("seats", "GHA-75,GHA-76")
-    PREFERRED_SEATS = [s.strip() for s in seats_raw.split(",")] if seats_raw else ["GHA-75", "GHA-76"]
+    CLICK_TIME = datetime(int(ymd[0]), int(ymd[1]), int(ymd[2]), int(hmss[0]), int(hmss[1]), int(hmss[2]))
+    seats_raw = config.get("seats", "75,76")
+    SEATS_INPUT = [s.strip() for s in seats_raw.split(",")] if seats_raw else []
 
     # Early check: warn if CLICK_TIME is already past
     if datetime.now() >= CLICK_TIME:
@@ -264,20 +268,55 @@ try:
         log("Warning: No JWT found")
 
     now = datetime.now()
-    log(f"  Now={now}  Target={CLICK_TIME}  Diff={(CLICK_TIME-now).total_seconds():.0f}s")
-    if now < CLICK_TIME:
-        wait = (CLICK_TIME - now).total_seconds()
-        log(f"\n[2] Waiting {wait:.1f}s until target time...")
-        while now < CLICK_TIME and not cancelled:
+    diff = (CLICK_TIME - now).total_seconds()
+    log(f"  Now={now}  Target={CLICK_TIME}  Diff={diff:.0f}s")
+
+    # Phase A: Wait until 5s before click time, then pre-locate the Book Now button
+    if diff > 5:
+        wait_before = diff - 5
+        log(f"\n[2] Waiting {wait_before:.0f}s, then pre-locating Book Now button...")
+        while (CLICK_TIME - datetime.now()).total_seconds() > 5 and not cancelled:
             time.sleep(0.5)
-            now = datetime.now()
     check_cancel()
 
-    log(f"\n[3] Clicking BOOK NOW at {datetime.now().strftime('%H:%M:%S.%f')[:-3]}...")
-    check_cancel()
-    for _ in range(30):
+    # Pre-locate the target train's "Book Now" button and save click JS
+    log(f"  Pre-locating Book Now button ({(CLICK_TIME-datetime.now()).total_seconds():.1f}s before target)...")
+    book_now_found = None
+    for _ in range(15):
         check_cancel()
-        cards = page.evaluate(f"""() => {{
+        book_now_found = page.evaluate(f"""() => {{
+            const all = document.querySelectorAll('[class*="trip"], [class*="train"], [class*="result"]');
+            for (const el of all) {{
+                if (el.innerText.includes('{target_train}')) {{
+                    const buttons = el.querySelectorAll('.book-now-btn');
+                    for (const btn of buttons) {{
+                        const parent = btn.closest('[class*="coach"], [class*="class"], [class*="trip"]');
+                        if (parent && parent.innerText.includes('{CLASS}')) {{
+                            return {{
+                                found: true,
+                                parentText: parent.innerText.substring(0, 50)
+                            }};
+                        }}
+                    }}
+                    if (buttons.length > 0) {{
+                        return {{ found: true, parentText: '' }};
+                    }}
+                }}
+            }}
+            return {{ found: false }};
+        }}""")
+        if book_now_found and book_now_found.get("found"):
+            log(f"  Book Now button confirmed for {target_train} / {CLASS}")
+            break
+        page.wait_for_timeout(500)
+
+    # Use JavaScript setTimeout for sub-ms precision click at target time
+    target_ms = int(CLICK_TIME.timestamp() * 1000)
+    t_click_start = time.time()
+    page.evaluate(f"""() => {{
+        const target = {target_ms};
+        const delay = Math.max(0, target - Date.now());
+        setTimeout(() => {{
             const all = document.querySelectorAll('[class*="trip"], [class*="train"], [class*="result"]');
             for (const el of all) {{
                 if (el.innerText.includes('{target_train}')) {{
@@ -286,28 +325,61 @@ try:
                         const parent = btn.closest('[class*="coach"], [class*="class"], [class*="trip"]');
                         if (parent && parent.innerText.includes('{CLASS}')) {{
                             btn.click();
-                            return true;
+                            window.__bookNowClicked = true;
+                            return;
                         }}
                     }}
-                    buttons[0].click();
-                    return true;
+                    if (buttons.length > 0) {{
+                        buttons[0].click();
+                        window.__bookNowClicked = true;
+                        return;
+                    }}
                 }}
             }}
-            return false;
-        }}""")
-        if cards:
-            log(f"  Found: {target_train} / {CLASS}")
-            break
-        page.wait_for_timeout(500)
+        }}, delay);
+    }}""")
+    # Wait for the JS timer to fire + small buffer
+    remaining = (CLICK_TIME - datetime.now()).total_seconds()
+    if remaining > 0:
+        time.sleep(remaining + 0.1)
     else:
-        log(f"  {target_train} not found, using first available train")
-        page.locator(".book-now-btn").first.click()
+        time.sleep(0.1)
+    t_click_actual = time.time()
+    log(f"\n[3] Book Now fired (JS timer target: {CLICK_TIME.strftime('%H:%M:%S.%f')[:-3]}, page confirmed: {page.evaluate('window.__bookNowClicked || false')})")
 
-    log("[4] Waiting for seat layout...")
+    # Fallback: if JS timer didn't work, click manually
+    if not page.evaluate("window.__bookNowClicked || false"):
+        log("  JS timer did not fire, clicking manually...")
+        for _ in range(30):
+            check_cancel()
+            cards = page.evaluate(f"""() => {{
+                const all = document.querySelectorAll('[class*="trip"], [class*="train"], [class*="result"]');
+                for (const el of all) {{
+                    if (el.innerText.includes('{target_train}')) {{
+                        const buttons = el.querySelectorAll('.book-now-btn');
+                        for (const btn of buttons) {{
+                            const parent = btn.closest('[class*="coach"], [class*="class"], [class*="trip"]');
+                            if (parent && parent.innerText.includes('{CLASS}')) {{
+                                btn.click();
+                                return true;
+                            }}
+                        }}
+                        buttons[0].click();
+                        return true;
+                    }}
+                }}
+                return false;
+            }}""")
+            if cards:
+                break
+            page.wait_for_timeout(500)
+
+    log(f"\n[4] Waiting for seat layout ({(datetime.now()-CLICK_TIME).total_seconds()*1000:.0f}ms after target)...")
     for _ in range(30):
         check_cancel()
         sel = page.query_selector("#select-bogie")
         if sel and sel.is_visible():
+            log(f"  Seat layout loaded ({(datetime.now()-CLICK_TIME).total_seconds()*1000:.0f}ms after target)")
             break
         page.wait_for_timeout(500)
     else:
@@ -334,10 +406,27 @@ try:
 
     page.select_option("#select-bogie", value=gha_val or "1")
 
+    selected_coach_text = None
+    for o in options:
+        if o["v"] == (gha_val or "1"):
+            selected_coach_text = o["t"]
+            break
+    coach_prefix = selected_coach_text.split(" - ")[0].strip() if selected_coach_text else "GHA"
+
+    PREFERRED_SEATS = []
+    for s in SEATS_INPUT:
+        if s.isdigit():
+            PREFERRED_SEATS.append(f"{coach_prefix}-{s}")
+        else:
+            PREFERRED_SEATS.append(s)
+    if not PREFERRED_SEATS:
+        PREFERRED_SEATS = [f"{coach_prefix}-75", f"{coach_prefix}-76"]
+
     for _ in range(30):
         check_cancel()
         count = page.evaluate("document.querySelectorAll('.modal-body button.btn-seat').length")
         if count > 0:
+            log(f"  Seat buttons rendered: {count} seats ({(datetime.now()-CLICK_TIME).total_seconds()*1000:.0f}ms after target)")
             break
         page.wait_for_timeout(500)
 
@@ -348,7 +437,7 @@ try:
             return {seat: b.title || b.innerText.trim(), ticket_id: w ? w.getAttribute('ticketid') : ''};
         });
     }""")
-    log(f"  Available: {[s['seat'] for s in available]}")
+    log(f"  Seats available: {len(available)} seats ({(datetime.now()-CLICK_TIME).total_seconds()*1000:.0f}ms after target)")
     check_cancel()
 
     if not available:
@@ -379,35 +468,50 @@ try:
 
     t0 = time.time()
     clicked = set()
+    targets_tried = False
 
     while len([r for r in results if r.get("data", {}).get("ack") == 1]) < num_seats:
         check_cancel()
 
-        available = page.evaluate("""() => {
-            const btns = document.querySelectorAll('.modal-body button.btn-seat.seat-available');
-            return Array.from(btns).map(b => {
-                const w = b.closest('[ticketid]');
-                return {seat: b.title || b.innerText.trim(), ticket_id: w ? w.getAttribute('ticketid') : ''};
-            });
-        }""")
-        seats_to_try = [s for s in available if s["ticket_id"] not in clicked]
+        if not targets_tried and targets:
+            targets_tried = True
+            seats_to_try = [s for s in targets if s["ticket_id"] not in clicked]
+            log(f"  Trying {len(seats_to_try)} preferred targets: {[s['seat'] for s in seats_to_try]}")
+        else:
+            available = page.evaluate("""() => {
+                const btns = document.querySelectorAll('.modal-body button.btn-seat.seat-available');
+                return Array.from(btns).map(b => {
+                    const w = b.closest('[ticketid]');
+                    return {seat: b.title || b.innerText.trim(), ticket_id: w ? w.getAttribute('ticketid') : ''};
+                });
+            }""")
+            seats_to_try = [s for s in available if s["ticket_id"] not in clicked]
+            if not seats_to_try:
+                log("  No more available seats to try.")
+                break
+            seats_to_try.sort(key=lambda s: 0 if s["seat"] in PREFERRED_SEATS else 1)
+            seats_to_try = seats_to_try[:num_seats]
+            log(f"  Trying {len(seats_to_try)} more seats: {[s['seat'] for s in seats_to_try]}")
 
         if not seats_to_try:
             log("  No more available seats to try.")
             break
 
-        # Prioritize preferred seats
-        seats_to_try.sort(key=lambda s: 0 if s["seat"] in PREFERRED_SEATS else 1)
-        seats_to_try = seats_to_try[:num_seats]
-
-        log(f"  Trying {len(seats_to_try)} seats: {[s['seat'] for s in seats_to_try]}")
         for seat in seats_to_try:
             clicked.add(seat["ticket_id"])
+            t_click = time.time()
             page.evaluate(f"""() => {{
-                const w = document.querySelector('[ticketid="{seat["ticket_id"]}"]');
-                if (w) {{ const b = w.querySelector('button'); if (b && !b.disabled) b.click(); }}
-            }}""")
-            page.wait_for_timeout(200)
+                const name = '{seat["seat"]}';
+                const btns = document.querySelectorAll('.modal-body button.btn-seat.seat-available');
+                for (const b of btns) {{
+                    if ((b.title || b.innerText.trim()) === name && !b.disabled) {{
+                        b.click();
+                        break;
+                    }}
+                }}
+}}""")
+            log(f"    Clicked {seat['seat']} ({(t_click-t0)*1000:.0f}ms, +{(time.time()-t_click)*1000:.0f}ms eval)")
+            page.wait_for_timeout(random.randint(200, 250))
 
         for _ in range(40):
             check_cancel()
@@ -422,7 +526,7 @@ try:
     log(f"\n[5] Results ({total:.2f}s total):")
     for i, r in enumerate(confirmed):
         d = r.get("data", {})
-        log(f"  Seat {i+1}: ack={d.get('ack')} msg={d.get('message')}")
+        log(f"  Seat {i+1}: ack={d.get('ack')} msg={d.get('message')} data={d}")
     if len(confirmed) < num_seats:
         log(f"  Only {len(confirmed)}/{num_seats} seats confirmed.")
 
