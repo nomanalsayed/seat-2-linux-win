@@ -462,8 +462,11 @@ try:
     results = []
     def on_resp(r):
         if "reserve-seat" in r.url:
-            try: results.append(r.json())
-            except: pass
+            try:
+                data = r.json()
+                results.append(data)
+            except Exception as e:
+                log(f"  WARN: response json() failed for {r.url}: {e}")
     page.on("response", on_resp)
 
     t0 = time.time()
@@ -524,9 +527,14 @@ try:
     confirmed = [r for r in results if r.get("data", {}).get("ack") == 1]
 
     log(f"\n[5] Results ({total:.2f}s total):")
+    log(f"  Total responses captured: {len(results)}")
     for i, r in enumerate(confirmed):
         d = r.get("data", {})
         log(f"  Seat {i+1}: ack={d.get('ack')} msg={d.get('message')} data={d}")
+    for i, r in enumerate(results):
+        if r not in confirmed:
+            d = r.get("data", {})
+            log(f"  Failed {i+1}: ack={d.get('ack')} msg={d.get('message')} data={d}")
     if len(confirmed) < num_seats:
         log(f"  Only {len(confirmed)}/{num_seats} seats confirmed.")
 
